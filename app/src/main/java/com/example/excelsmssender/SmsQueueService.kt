@@ -27,6 +27,7 @@ class SmsQueueService : Service() {
     private var queue: SmsQueueState? = null
     private var activeMessageIndex: Int? = null
     private var isForeground = false
+    private val multipartTrackers = mutableMapOf<Int, MultipartTracker>()
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -215,8 +216,24 @@ class SmsQueueService : Service() {
                 handler.post(::processNext)
                 return
             }
-            smsManager.sendTextMessage(phone, null, entry.message.message, sentIntent, deliveryIntent)
-            Log.i(TAG, "Submitted SMS request for row ${entry.index + 1} to $phone; awaiting platform callback")
+            val parts = smsManager.divideMessage(entry.message.message)
+            if (parts.size <= 1) {
+                smsManager.sendTextMessage(phone, null, entry.message.message, sentIntent, deliveryIntent)
+                Log.i(TAG, "Submitted SMS request for row ${entry.index + 1} to $phone; awaiting platform callback")
+            } else {
+                // A single SMS segment holds 160 GSM chars (70 for Unicode/Urdu). Longer
+                // messages are rejected by the radio with a generic failure even when the
+                // SIM has balance, so split them and send as multipart instead.
+                val sentIntents = ArrayList<PendingIntent>(parts.size)
+                val deliveryIntents = ArrayList<PendingIntent>(parts.size)
+                for (partIndex in parts.indices) {
+                    sentIntents.add(callbackIntent(sessionId, entry.index, CALLBACK_SENT, partIndex))
+                    deliveryIntents.add(callbackIntent(sessionId, entry.index, CALLBACK_DELIVERED, partIndex))
+                }
+                multipartTrackers[entry.index] = MultipartTracker(parts.size)
+                smsManager.sendMultipartTextMessage(phone, null, parts, sentIntents, deliveryIntents)
+                Log.i(TAG, "Submitted ${parts.size}-part SMS for row ${entry.index + 1} to $phone; awaiting platform callbacks")
+            }
         } catch (e: SecurityException) {
             Log.e(TAG, "SMS permission or platform policy prevented row ${entry.index + 1}", e)
             failCurrent(entry.index, "SMS permission or platform policy denied submission")
@@ -238,17 +255,18 @@ class SmsQueueService : Service() {
         }
     }
 
-    private fun callbackIntent(sessionId: String, index: Int, callbackType: String): PendingIntent {
+    private fun callbackIntent(sessionId: String, index: Int, callbackType: String, partIndex: Int = 0): PendingIntent {
         val action = if (callbackType == CALLBACK_SENT) ACTION_SMS_SENT else ACTION_SMS_DELIVERED
         val intent = Intent(this, SmsCallbackReceiver::class.java)
             .setAction(action)
-            .setData(android.net.Uri.parse("sms-sender://$sessionId/$callbackType/$index"))
+            .setData(android.net.Uri.parse("sms-sender://$sessionId/$callbackType/$index/$partIndex"))
             .putExtra(EXTRA_SESSION_ID, sessionId)
             .putExtra(EXTRA_MESSAGE_INDEX, index)
             .putExtra(EXTRA_CALLBACK_TYPE, callbackType)
+            .putExtra(EXTRA_PART_INDEX, partIndex)
         return PendingIntent.getBroadcast(
             this,
-            index,
+            index * 1000 + partIndex,
             intent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
@@ -270,8 +288,15 @@ class SmsQueueService : Service() {
             return
         }
 
+        val partIndex = intent.getIntExtra(EXTRA_PART_INDEX, 0)
+        val tracker = multipartTrackers[index]
+
         if (callbackType == CALLBACK_DELIVERED) {
-            handleDeliveryCallback(index, resultCode)
+            if (tracker != null) {
+                handleMultipartDeliveryCallback(index, partIndex, resultCode, tracker)
+            } else {
+                handleDeliveryCallback(index, resultCode)
+            }
             if (queue?.runStatus !in setOf(QueueRunStatus.RUNNING, QueueRunStatus.PAUSED)) {
                 stopService()
             }
@@ -279,6 +304,11 @@ class SmsQueueService : Service() {
         }
         if (callbackType != CALLBACK_SENT || activeMessageIndex != index) {
             Log.w(TAG, "Ignoring duplicate or unexpected sent callback for row ${index + 1}")
+            return
+        }
+
+        if (tracker != null) {
+            handleMultipartSentCallback(index, partIndex, resultCode, tracker)
             return
         }
 
@@ -321,6 +351,79 @@ class SmsQueueService : Service() {
             val reason = deliveryFailureReason(resultCode)
             updateEntry(index) { it.copy(deliveryNote = reason) }
             Log.w(TAG, "Delivery report did not confirm row ${index + 1}: $reason (result=$resultCode)")
+        }
+        publishState()
+    }
+
+    private fun handleMultipartSentCallback(index: Int, partIndex: Int, resultCode: Int, tracker: MultipartTracker) {
+        val safePart = partIndex.coerceIn(0, tracker.totalParts - 1)
+        tracker.sentOk[safePart] = resultCode == android.app.Activity.RESULT_OK
+        if (resultCode != android.app.Activity.RESULT_OK && tracker.firstSentFailure == null) {
+            tracker.firstSentFailure = resultCode
+        }
+        tracker.sentCount++
+        Log.i(TAG, "Sent callback for row ${index + 1} part ${safePart + 1}/${tracker.totalParts}: result=$resultCode")
+        if (!tracker.sentComplete) {
+            // Wait for the remaining parts; keep activeMessageIndex so the queue does not advance early.
+            return
+        }
+
+        activeMessageIndex = null
+        if (tracker.firstSentFailure == null) {
+            updateEntry(index) { it.copy(status = SmsStatus.SENT, failureReason = null) }
+            Log.i(TAG, "Android accepted all ${tracker.totalParts} SMS parts for row ${index + 1}")
+        } else {
+            val reason = sentFailureReason(tracker.firstSentFailure!!)
+            updateEntry(index) { it.copy(status = SmsStatus.FAILED, failureReason = reason) }
+            Log.e(TAG, "SMS submission failed for row ${index + 1}: $reason (result=${tracker.firstSentFailure})")
+            multipartTrackers.remove(index)
+        }
+        publishState()
+        if (tracker.firstSentFailure == null && tracker.deliveryComplete) {
+            finishMultipartDelivery(index, tracker)
+        }
+
+        if (queue?.runStatus == QueueRunStatus.STOPPED) {
+            val latest = queue
+            if (latest != null && latest.entries.none {
+                    it.status == SmsStatus.PENDING || it.status == SmsStatus.SENDING
+                }
+            ) {
+                queue = latest.copy(runStatus = QueueRunStatus.COMPLETED, currentQueueIndex = null)
+                publishState()
+            }
+            stopService()
+        } else {
+            handler.post(::processNext)
+        }
+    }
+
+    private fun handleMultipartDeliveryCallback(index: Int, partIndex: Int, resultCode: Int, tracker: MultipartTracker) {
+        val safePart = partIndex.coerceIn(0, tracker.totalParts - 1)
+        tracker.deliveryOk[safePart] = resultCode == android.app.Activity.RESULT_OK
+        if (resultCode != android.app.Activity.RESULT_OK && tracker.firstDeliveryFailure == null) {
+            tracker.firstDeliveryFailure = resultCode
+        }
+        tracker.deliveryCount++
+        if (!tracker.deliveryComplete) return
+        val entry = queue?.entries?.getOrNull(index)
+        if (entry?.status in setOf(SmsStatus.SENT, SmsStatus.DELIVERED)) {
+            finishMultipartDelivery(index, tracker)
+        } else {
+            multipartTrackers.remove(index)
+            Log.w(TAG, "Multipart delivery reports finished without a successful submission for row ${index + 1}")
+        }
+    }
+
+    private fun finishMultipartDelivery(index: Int, tracker: MultipartTracker) {
+        multipartTrackers.remove(index)
+        if (tracker.firstDeliveryFailure == null) {
+            updateEntry(index) { it.copy(status = SmsStatus.DELIVERED, deliveryNote = null) }
+            Log.i(TAG, "Delivery reports confirmed all ${tracker.totalParts} parts of row ${index + 1}")
+        } else {
+            val note = deliveryFailureReason(tracker.firstDeliveryFailure!!)
+            updateEntry(index) { it.copy(deliveryNote = note) }
+            Log.w(TAG, "Delivery reports did not confirm all parts of row ${index + 1}: $note")
         }
         publishState()
     }
@@ -414,6 +517,7 @@ class SmsQueueService : Service() {
         const val EXTRA_SESSION_ID = "session_id"
         const val EXTRA_MESSAGE_INDEX = "message_index"
         const val EXTRA_CALLBACK_TYPE = "callback_type"
+        const val EXTRA_PART_INDEX = "part_index"
         const val EXTRA_RESULT_CODE = "result_code"
         private const val TAG = "SmsSender"
         private const val CHANNEL_ID = "sms_queue"
@@ -507,4 +611,15 @@ private fun deliveryFailureReason(resultCode: Int): String = when (resultCode) {
     SmsManager.RESULT_ERROR_NO_SERVICE -> "Delivery report unavailable: no network service"
     SmsManager.RESULT_ERROR_RADIO_OFF -> "Delivery report unavailable: mobile radio is off"
     else -> "Delivery report unavailable or failed (result $resultCode)"
+}
+
+private class MultipartTracker(val totalParts: Int) {
+    val sentOk = BooleanArray(totalParts)
+    var sentCount = 0
+    var firstSentFailure: Int? = null
+    val deliveryOk = BooleanArray(totalParts)
+    var deliveryCount = 0
+    var firstDeliveryFailure: Int? = null
+    val sentComplete: Boolean get() = sentCount >= totalParts
+    val deliveryComplete: Boolean get() = deliveryCount >= totalParts
 }

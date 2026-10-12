@@ -463,6 +463,32 @@ private fun messagesError(error: Throwable): String {
     return cause.message ?: "Unable to read Excel file"
 }
 
+private fun normalizePhoneNumber(raw: String): String {
+    var number = raw.trim()
+    // Excel often stores phone numbers as numeric cells, which drops the leading
+    // zero and may render as "3193656294.0" or "3.193656294E9".
+    number.toDoubleOrNull()?.let { value ->
+        if (value % 1.0 == 0.0 && value < 1e15) {
+            number = value.toLong().toString()
+        }
+    }
+    // Keep only digits, preserving a leading '+'.
+    val hasPlus = number.startsWith("+")
+    number = number.filter(Char::isDigit)
+    if (hasPlus) number = "+$number"
+    // Pakistani mobile numbers are 11 digits starting with 0. Restore the zero
+    // that Excel stripped from numeric cells ("3193656294" -> "03193656294").
+    // Without it the destination is not routable and the radio rejects the send.
+    if (!number.startsWith("+")) {
+        if (number.length == 10 && number.startsWith("3")) {
+            number = "0$number"
+        } else if (number.length == 12 && number.startsWith("92")) {
+            number = "+$number"
+        }
+    }
+    return number
+}
+
 private fun readExcelFile(context: Context, uri: Uri): List<SmsMessage> {
     val result = mutableListOf<SmsMessage>()
     context.contentResolver.openInputStream(uri).use { inputStream ->
@@ -474,7 +500,7 @@ private fun readExcelFile(context: Context, uri: Uri): List<SmsMessage> {
 
         val rows = sheet.selectRangeValuesWithString("A2:B${sheet.maxRows}")
         for (row in rows) {
-            val phone = row.getOrNull(0)?.toString()?.trim().orEmpty()
+            val phone = normalizePhoneNumber(row.getOrNull(0)?.toString().orEmpty())
             val message = row.getOrNull(1)?.toString()?.trim().orEmpty()
             if (phone.isNotBlank() || message.isNotBlank()) {
                 result.add(SmsMessage(phoneNumber = phone, message = message))
